@@ -33,6 +33,9 @@ LED_BRIGHTNESS = 150  # Increased for better POV visibility
 LED_INVERT = False
 LED_CHANNEL = 0
 
+# WS2815 Color Order - set to True for GRB strips (most WS2815), False for RGB
+LED_IS_GRB = True  # Your strip uses GRB color order
+
 HALL_SENSOR_PIN = 4
 BUTTON_CIRCLE = 17
 BUTTON_SQUARE = 27
@@ -132,10 +135,30 @@ strip.begin()
 
 # ============== UTILITY FUNCTIONS ==============
 
+def make_color(r, g, b):
+    """
+    Create a color value for the LED strip, handling GRB vs RGB order.
+    
+    Args:
+        r: Red value (0-255)
+        g: Green value (0-255)
+        b: Blue value (0-255)
+    
+    Returns:
+        Color value in the correct byte order for your LED strip
+    """
+    if LED_IS_GRB:
+        # WS2815 GRB order: swap R and G
+        return Color(int(g), int(r), int(b))
+    else:
+        # Standard RGB order
+        return Color(int(r), int(g), int(b))
+
+
 def clear_strip():
     """Turn off all LEDs"""
     for i in range(NUM_LEDS):
-        strip.setPixelColor(i, Color(0, 0, 0))
+        strip.setPixelColor(i, make_color(0, 0, 0))
     strip.show()
 
 
@@ -159,8 +182,12 @@ def generate_circle_data(radius_leds=28, color_rgb=(0, 255, 255)):
     # 16 divisions = 22.5° each, need thick outline
     circle_thickness = max(3, 7 - NUM_DIVISIONS // 5)  # 3-5 LEDs thick
     
+    # Pre-calculate the color with brightness applied
+    pixel_color = make_color(r * BRIGHTNESS_RATIO, g * BRIGHTNESS_RATIO, b * BRIGHTNESS_RATIO)
+    off_color = make_color(0, 0, 0)
+    
     for angle_idx in range(NUM_DIVISIONS):
-        line = [Color(0, 0, 0)] * NUM_LEDS
+        line = [off_color] * NUM_LEDS
         
         if radius_leds < NUM_LEDS // 2:
             # Draw circle outline with thickness (both sides of strip)
@@ -171,13 +198,9 @@ def generate_circle_data(radius_leds=28, color_rgb=(0, 255, 255)):
                 led_pos_2 = center_led + radius_leds + offset
                 
                 if 0 <= led_pos_1 < NUM_LEDS:
-                    line[led_pos_1] = Color(int(g * BRIGHTNESS_RATIO), 
-                                           int(r * BRIGHTNESS_RATIO), 
-                                           int(b * BRIGHTNESS_RATIO))
+                    line[led_pos_1] = pixel_color
                 if 0 <= led_pos_2 < NUM_LEDS:
-                    line[led_pos_2] = Color(int(g * BRIGHTNESS_RATIO), 
-                                           int(r * BRIGHTNESS_RATIO), 
-                                           int(b * BRIGHTNESS_RATIO))
+                    line[led_pos_2] = pixel_color
         
         data.append(line)
     
@@ -199,8 +222,12 @@ def generate_square_data(side_length_leds=24, color_rgb=(255, 0, 255)):
     # Half the side length
     half_side = side_length_leds // 2
     
+    # Pre-calculate colors
+    pixel_color = make_color(r * BRIGHTNESS_RATIO, g * BRIGHTNESS_RATIO, b * BRIGHTNESS_RATIO)
+    off_color = make_color(0, 0, 0)
+    
     for angle_idx in range(NUM_DIVISIONS):
-        line = [Color(0, 0, 0)] * NUM_LEDS
+        line = [off_color] * NUM_LEDS
         
         # Calculate angle in radians
         angle_rad = (angle_idx * 2 * math.pi / NUM_DIVISIONS)
@@ -220,13 +247,9 @@ def generate_square_data(side_length_leds=24, color_rgb=(255, 0, 255)):
             led_pos_2 = center_led + distance + offset
             
             if 0 <= led_pos_1 < NUM_LEDS:
-                line[led_pos_1] = Color(int(g * BRIGHTNESS_RATIO), 
-                                       int(r * BRIGHTNESS_RATIO), 
-                                       int(b * BRIGHTNESS_RATIO))
+                line[led_pos_1] = pixel_color
             if 0 <= led_pos_2 < NUM_LEDS:
-                line[led_pos_2] = Color(int(g * BRIGHTNESS_RATIO), 
-                                       int(r * BRIGHTNESS_RATIO), 
-                                       int(b * BRIGHTNESS_RATIO))
+                line[led_pos_2] = pixel_color
         
         data.append(line)
     
@@ -254,9 +277,10 @@ def load_image_data(image_path):
         data = []
         angle_increment = 360.0 / NUM_DIVISIONS
         num_leds_per_side = NUM_LEDS // 2
+        off_color = make_color(0, 0, 0)
         
         for slice_idx in range(NUM_DIVISIONS):
-            line = [Color(0, 0, 0)] * NUM_LEDS
+            line = [off_color] * NUM_LEDS
             angle_deg = slice_idx * angle_increment
             angle_rad = math.radians(angle_deg)
             
@@ -269,9 +293,9 @@ def load_image_data(image_path):
                 if 0 <= x < width and 0 <= y < height:
                     r, g, b = image.getpixel((x, y))
                     led_pos = num_leds_per_side - led_idx - 1
-                    line[led_pos] = Color(int(g * BRIGHTNESS_RATIO), 
-                                         int(r * BRIGHTNESS_RATIO), 
-                                         int(b * BRIGHTNESS_RATIO))
+                    line[led_pos] = make_color(r * BRIGHTNESS_RATIO, 
+                                               g * BRIGHTNESS_RATIO, 
+                                               b * BRIGHTNESS_RATIO)
             
             # Second side (LEDs 36-71) - opposite angle
             opposite_angle_rad = angle_rad + math.pi
@@ -283,9 +307,9 @@ def load_image_data(image_path):
                 if 0 <= x < width and 0 <= y < height:
                     r, g, b = image.getpixel((x, y))
                     led_pos = num_leds_per_side + led_idx
-                    line[led_pos] = Color(int(g * BRIGHTNESS_RATIO), 
-                                         int(r * BRIGHTNESS_RATIO), 
-                                         int(b * BRIGHTNESS_RATIO))
+                    line[led_pos] = make_color(r * BRIGHTNESS_RATIO, 
+                                               g * BRIGHTNESS_RATIO, 
+                                               b * BRIGHTNESS_RATIO)
             
             data.append(line)
         
@@ -321,8 +345,12 @@ def load_binary_image_data(binary_data, color_rgb=(255, 255, 255)):
     
     print(f"Loading binary image: {num_divisions} divisions, {bytes_per_line} bytes/line")
     
+    # Pre-calculate colors
+    pixel_color = make_color(r * BRIGHTNESS_RATIO, g * BRIGHTNESS_RATIO, b * BRIGHTNESS_RATIO)
+    off_color = make_color(0, 0, 0)
+    
     for slice_idx in range(num_divisions):
-        line = [Color(0, 0, 0)] * NUM_LEDS
+        line = [off_color] * NUM_LEDS
         
         for byte_idx in range(bytes_per_line):
             byte_val = binary_data[slice_idx][byte_idx]
@@ -333,15 +361,13 @@ def load_binary_image_data(binary_data, color_rgb=(255, 255, 255)):
                 if led_pos < NUM_LEDS:
                     # MSB first (bit 7 = first pixel in byte)
                     if byte_val & (1 << (7 - bit)):
-                        line[led_pos] = Color(int(g * BRIGHTNESS_RATIO),
-                                             int(r * BRIGHTNESS_RATIO),
-                                             int(b * BRIGHTNESS_RATIO))
+                        line[led_pos] = pixel_color
         
         data.append(line)
     
     # Pad if binary data has fewer divisions than configured
     while len(data) < NUM_DIVISIONS:
-        data.append([Color(0, 0, 0)] * NUM_LEDS)
+        data.append([off_color] * NUM_LEDS)
     
     print(f"✓ Binary image loaded ({len(data)} divisions)")
     return data
@@ -622,7 +648,7 @@ def main():
     
     # Startup indicator
     for i in range(NUM_LEDS):
-        strip.setPixelColor(i, Color(0, 30, 0) if i < 3 else Color(0, 0, 0))
+        strip.setPixelColor(i, make_color(0, 30, 0) if i < 3 else make_color(0, 0, 0))
     strip.show()
     
     try:
