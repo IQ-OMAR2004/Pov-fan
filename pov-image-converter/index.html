@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>POV Display Image Converter</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Animated background -->
+        <div class="bg-grid"></div>
+        <div class="bg-glow"></div>
+        
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+                        <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                </div>
+                <div class="logo-text">
+                    <h1>POV Converter</h1>
+                    <span>Image to LED Array</span>
+                </div>
+            </div>
+            <div class="header-info">
+                <div class="info-badge">
+                    <span class="badge-icon">⚡</span>
+                    <span>8x Compression</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Upload Section -->
+            <section class="upload-section">
+                <div class="section-header">
+                    <h2>Upload Images</h2>
+                    <p>Drag & drop or click to select images</p>
+                </div>
+                
+                <div class="dropzone" id="dropzone">
+                    <div class="dropzone-content">
+                        <div class="dropzone-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14"/>
+                                <path d="M14 8h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                            </svg>
+                        </div>
+                        <p class="dropzone-text">Drop images here</p>
+                        <p class="dropzone-subtext">or click to browse</p>
+                        <span class="dropzone-formats">PNG, JPG, GIF, WebP</span>
+                    </div>
+                    <input type="file" id="fileInput" multiple accept="image/*" hidden>
+                </div>
+
+                <!-- Settings -->
+                <div class="settings-panel">
+                    <div class="setting-group">
+                        <label class="setting-label">
+                            <span class="label-text">Resolution</span>
+                            <select id="resolution" class="setting-select">
+                                <option value="128">128 × 128 px</option>
+                                <option value="64">64 × 64 px</option>
+                                <option value="32">32 × 32 px</option>
+                                <option value="72" selected>72 LEDs (Custom)</option>
+                            </select>
+                        </label>
+                    </div>
+                    
+                    <div class="setting-group">
+                        <label class="setting-label">
+                            <span class="label-text">Divisions</span>
+                            <input type="number" id="divisions" class="setting-input" value="16" min="8" max="360">
+                        </label>
+                    </div>
+                    
+                    <div class="setting-group">
+                        <label class="setting-label">
+                            <span class="label-text">Threshold</span>
+                            <input type="range" id="threshold" class="setting-range" min="0" max="255" value="128">
+                            <span class="threshold-value" id="thresholdValue">128</span>
+                        </label>
+                    </div>
+                    
+                    <div class="setting-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="invertColors">
+                            <span class="checkbox-custom"></span>
+                            <span class="label-text">Invert Colors</span>
+                        </label>
+                    </div>
+                    
+                    <div class="setting-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="polarMode" checked>
+                            <span class="checkbox-custom"></span>
+                            <span class="label-text">POV Polar Mode</span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Preview Section -->
+            <section class="preview-section" id="previewSection">
+                <div class="section-header">
+                    <h2>Image Preview</h2>
+                    <button class="clear-btn" id="clearBtn">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                        </svg>
+                        Clear All
+                    </button>
+                </div>
+                <div class="preview-grid" id="previewGrid"></div>
+            </section>
+
+            <!-- Convert Button -->
+            <div class="convert-action">
+                <button class="convert-btn" id="convertBtn" disabled>
+                    <span class="btn-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                    </span>
+                    <span class="btn-text">Convert to Code</span>
+                </button>
+            </div>
+
+            <!-- Output Section -->
+            <section class="output-section" id="outputSection">
+                <div class="section-header">
+                    <h2>Generated Code</h2>
+                    <div class="output-actions">
+                        <button class="action-btn" id="copyAllBtn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                            </svg>
+                            Copy All
+                        </button>
+                        <button class="action-btn" id="downloadBtn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+                            </svg>
+                            Download
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="output-stats" id="outputStats"></div>
+                
+                <div class="code-container">
+                    <div class="code-header">
+                        <span class="code-lang">C++ / Arduino</span>
+                        <button class="copy-btn" id="copyCodeBtn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <pre class="code-output" id="codeOutput"></pre>
+                </div>
+
+                <!-- Python Output -->
+                <div class="code-container">
+                    <div class="code-header">
+                        <span class="code-lang">Python</span>
+                        <button class="copy-btn" id="copyPythonBtn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <pre class="code-output" id="pythonOutput"></pre>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>POV Display Image Converter • Made for LED Projects</p>
+        </footer>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" id="toast">
+        <span class="toast-icon">✓</span>
+        <span class="toast-text">Copied to clipboard!</span>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
+
