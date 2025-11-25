@@ -42,28 +42,37 @@ BUTTON_IMAGE = 22
 # Estimated LED update time in microseconds (72 LEDs @ 800kHz + overhead)
 LED_UPDATE_TIME_US = 2800  # ~2.8ms for 72 WS2815 LEDs
 
-# Target/default RPM when starting (before hall sensor calibrates)
-DEFAULT_RPM = 500
-MIN_RPM = 200
-MAX_RPM = 1500
+# Target/default RPM - set based on your actual motor!
+# Your logs show average ~800-900 RPM with spikes to 1200+
+DEFAULT_RPM = 900
+MIN_RPM = 250      # Reject readings below this (noise)
+MAX_RPM = 1400     # Reject readings above this (noise)
 
-# Calculate safe number of divisions based on LED timing
-# Formula: max_divisions = rotation_time_us / LED_UPDATE_TIME_US
-# At 500 RPM: 120,000µs / 2800µs ≈ 42 max divisions
-# Using 36 for safety margin and cleaner angles (360° / 36 = 10° per division)
-NUM_DIVISIONS = 36  # Reduced from 150 for realistic timing!
+# IMPORTANT: Based on your logs showing 800-1200 RPM typical:
+# At 1200 RPM: rotation = 50,000µs → max 17 divisions
+# At 900 RPM: rotation = 66,667µs → max 23 divisions  
+# Using 16 divisions for stable display at high RPM!
+NUM_DIVISIONS = 16  # Safe for your 800-1200 RPM range (22.5° per division)
 
-# Alternative presets - uncomment based on your motor speed:
-# NUM_DIVISIONS = 24  # For slower fans (300-400 RPM) - 15° per division
-# NUM_DIVISIONS = 48  # For faster fans (600-800 RPM) - 7.5° per division
-# NUM_DIVISIONS = 72  # For very fast fans (900+ RPM) - 5° per division
+# Alternative presets based on your motor:
+# NUM_DIVISIONS = 12  # Ultra-stable, works up to 1400 RPM
+# NUM_DIVISIONS = 18  # Good for 700-1100 RPM
+# NUM_DIVISIONS = 20  # Good for 600-1000 RPM
 
 # ============== DISPLAY CONFIGURATION ==============
-BRIGHTNESS_RATIO = 0.7  # Increased from 0.5 for better visibility
-LINES_TO_SHIFT = -6     # Adjusted for new division count (was -18 for 150 divisions)
+BRIGHTNESS_RATIO = 0.8  # Higher brightness for faster spin (less persistence time)
+LINES_TO_SHIFT = -3     # Adjusted for 16 divisions
 
 # Timing safety margin (microseconds to reserve for overhead)
-TIMING_MARGIN_US = 200
+TIMING_MARGIN_US = 300  # Increased for more headroom
+
+# ============== NOISE FILTERING ==============
+# Hall sensor debounce - ignore triggers too close together
+MIN_ROTATION_TIME_US = 40000   # Max 1500 RPM = 40ms minimum between triggers
+HALL_DEBOUNCE_US = 5000        # Ignore triggers within 5ms of last one
+
+# RPM change threshold - reject sudden jumps (likely noise)
+MAX_RPM_CHANGE_PERCENT = 40    # Reject if RPM changes more than 40% suddenly
 
 # ============== GLOBAL VARIABLES ==============
 current_mode = "circle"
@@ -76,10 +85,14 @@ time_per_line_micros = rotation_time_micros // NUM_DIVISIONS
 current_line = 0
 rotation_active = False
 
-# RPM tracking for display and adjustment
+# RPM tracking with aggressive smoothing
 current_rpm = DEFAULT_RPM
-rpm_history = []  # Store last few RPM readings for smoothing
-RPM_HISTORY_SIZE = 5  # Number of rotations to average
+stable_rpm = DEFAULT_RPM           # Filtered/stable RPM value
+rpm_history = []                   # Store RPM readings for smoothing
+RPM_HISTORY_SIZE = 15              # Increased! More samples = smoother (was 5)
+rpm_locked = False                 # Once stable, lock the RPM
+rpm_lock_threshold = 10            # Lock after this many stable readings
+rpm_stable_count = 0               # Count of consecutive stable readings
 
 # Actual measured timing vs expected
 actual_line_time_us = 0
@@ -89,10 +102,13 @@ last_button_states = {BUTTON_CIRCLE: GPIO.HIGH, BUTTON_SQUARE: GPIO.HIGH, BUTTON
 last_button_time = {BUTTON_CIRCLE: 0, BUTTON_SQUARE: 0, BUTTON_IMAGE: 0}
 DEBOUNCE_TIME = 0.3
 
-# Hall sensor tracking
+# Hall sensor tracking with debouncing
 last_hall_state = GPIO.LOW
+last_hall_trigger_time = 0         # For debouncing
 rotation_count = 0
-missed_lines_count = 0  # Track if we're missing lines due to slow updates
+valid_rotation_count = 0           # Only count valid (non-noise) rotations
+missed_lines_count = 0             # Track if we're missing lines
+noise_rejected_count = 0           # Track rejected noise triggers
 
 # ============== GPIO SETUP ==============
 GPIO.setmode(GPIO.BCM)
@@ -130,26 +146,28 @@ def get_time_micros():
 
 # ============== SHAPE GENERATION ==============
 
-def generate_circle_data(radius_leds=30, color_rgb=(0, 255, 255)):
+def generate_circle_data(radius_leds=28, color_rgb=(0, 255, 255)):
     """
     Generate circle data - displays at constant radius from center.
-    With fewer divisions, we make the circle thicker for visibility.
+    With fewer divisions (16-20), we make the circle thicker for visibility.
     """
     data = []
     center_led = NUM_LEDS // 2
     r, g, b = color_rgb
     
-    # Make circle thicker with fewer divisions (more visible)
-    # With 36 divisions, each LED position covers 10°, so we need thickness
-    circle_thickness = max(2, 5 - NUM_DIVISIONS // 20)  # Thicker for fewer divisions
+    # Thicker circle for fewer divisions (more visible at high RPM)
+    # 16 divisions = 22.5° each, need thick outline
+    circle_thickness = max(3, 7 - NUM_DIVISIONS // 5)  # 3-5 LEDs thick
     
     for angle_idx in range(NUM_DIVISIONS):
         line = [Color(0, 0, 0)] * NUM_LEDS
         
         if radius_leds < NUM_LEDS // 2:
-            # Draw circle outline with thickness
+            # Draw circle outline with thickness (both sides of strip)
             for offset in range(-circle_thickness // 2, circle_thickness // 2 + 1):
+                # Inner half of strip (LEDs 0 to center)
                 led_pos_1 = center_led - radius_leds + offset
+                # Outer half of strip (LEDs center to end)
                 led_pos_2 = center_led + radius_leds + offset
                 
                 if 0 <= led_pos_1 < NUM_LEDS:
@@ -166,44 +184,37 @@ def generate_circle_data(radius_leds=30, color_rgb=(0, 255, 255)):
     return data
 
 
-def generate_square_data(side_length_leds=25, color_rgb=(255, 0, 255)):
+def generate_square_data(side_length_leds=24, color_rgb=(255, 0, 255)):
     """
-    Generate CLEAR square data using proper polar-to-cartesian math.
-    A square in polar coordinates has varying radius depending on angle.
+    Generate square using polar-to-cartesian math.
+    Optimized for low division counts (16-20 divisions).
     """
     data = []
     center_led = NUM_LEDS // 2
     r, g, b = color_rgb
     
-    # Edge thickness for visibility
-    edge_thickness = max(2, 4 - NUM_DIVISIONS // 20)
+    # Thicker edges for fewer divisions
+    edge_thickness = max(3, 6 - NUM_DIVISIONS // 5)
     
-    # Half the side length (distance from center to edge at cardinal directions)
+    # Half the side length
     half_side = side_length_leds // 2
     
     for angle_idx in range(NUM_DIVISIONS):
         line = [Color(0, 0, 0)] * NUM_LEDS
         
-        # Calculate angle in radians (0 to 2π)
+        # Calculate angle in radians
         angle_rad = (angle_idx * 2 * math.pi / NUM_DIVISIONS)
-        angle_deg = math.degrees(angle_rad) % 360
         
-        # For a square centered at origin, the distance from center to edge
-        # varies with angle. Using the formula for a square:
-        # r = half_side / max(|cos(θ)|, |sin(θ)|)
+        # Square formula: r = half_side / max(|cos(θ)|, |sin(θ)|)
         cos_a = abs(math.cos(angle_rad))
         sin_a = abs(math.sin(angle_rad))
-        
-        # Avoid division by zero
         max_trig = max(cos_a, sin_a, 0.001)
         
-        # Distance from center to square edge at this angle
+        # Distance from center to square edge
         distance = int(half_side / max_trig)
+        distance = min(distance, center_led - 2)  # Keep within LED range
         
-        # Clamp to valid LED range
-        distance = min(distance, center_led - 1)
-        
-        # Draw the square outline with thickness
+        # Draw thick outline
         for offset in range(-edge_thickness // 2, edge_thickness // 2 + 1):
             led_pos_1 = center_led - distance + offset
             led_pos_2 = center_led + distance + offset
@@ -317,14 +328,18 @@ def check_buttons():
 
 def check_hall_sensor():
     """
-    Poll hall sensor - THIS IS THE KEY!
-    When sensor triggers = 0° position (start of rotation)
-    Calculate timing from LAST rotation with smoothing
-    Use that timing for CURRENT rotation
+    Poll hall sensor with noise filtering and debouncing.
+    Key improvements:
+    1. Hardware debounce - ignore triggers too close together
+    2. RPM validation - reject readings outside expected range
+    3. Outlier rejection - reject sudden RPM jumps (noise)
+    4. Aggressive smoothing - average over 15 rotations
     """
     global last_hall_state, last_rotation_micros, rotation_time_micros
     global time_per_line_micros, current_line, rotation_count, rotation_active
-    global current_rpm, rpm_history, actual_line_time_us, missed_lines_count
+    global current_rpm, stable_rpm, rpm_history, missed_lines_count
+    global last_hall_trigger_time, valid_rotation_count, noise_rejected_count
+    global rpm_locked, rpm_stable_count
     
     current_state = GPIO.input(HALL_SENSOR_PIN)
     
@@ -332,52 +347,83 @@ def check_hall_sensor():
     if current_state == GPIO.HIGH and last_hall_state == GPIO.LOW:
         current_time = get_time_micros()
         
-        # Calculate how long the LAST rotation took
+        # DEBOUNCE: Ignore triggers too close to last one (noise/bounce)
+        time_since_last = current_time - last_hall_trigger_time
+        if time_since_last < HALL_DEBOUNCE_US:
+            last_hall_state = current_state
+            noise_rejected_count += 1
+            return
+        
+        last_hall_trigger_time = current_time
+        
+        # Calculate rotation time
         if last_rotation_micros > 0:
             measured_rotation_time = current_time - last_rotation_micros
             
-            # Validate the measurement (reject noise/bounces)
-            # At MIN_RPM (200): max rotation time = 300,000µs (300ms)
-            # At MAX_RPM (1500): min rotation time = 40,000µs (40ms)
-            min_rotation_time = int(60_000_000 / MAX_RPM)
-            max_rotation_time = int(60_000_000 / MIN_RPM)
+            # VALIDATION 1: Check if rotation time is in valid RPM range
+            min_rotation_time = int(60_000_000 / MAX_RPM)  # ~42ms at 1400 RPM
+            max_rotation_time = int(60_000_000 / MIN_RPM)  # ~240ms at 250 RPM
             
-            if min_rotation_time <= measured_rotation_time <= max_rotation_time:
-                # Calculate RPM from this rotation
-                instant_rpm = 60_000_000 / measured_rotation_time
+            if not (min_rotation_time <= measured_rotation_time <= max_rotation_time):
+                # Outside valid range - likely noise
+                noise_rejected_count += 1
+                last_hall_state = current_state
+                # Still reset position but don't update timing
+                current_line = 0
+                rotation_count += 1
+                last_rotation_micros = current_time
+                return
+            
+            # Calculate instant RPM
+            instant_rpm = 60_000_000 / measured_rotation_time
+            
+            # VALIDATION 2: Reject sudden RPM jumps (outliers)
+            if len(rpm_history) >= 3:
+                avg_rpm = sum(rpm_history) / len(rpm_history)
+                rpm_change_percent = abs(instant_rpm - avg_rpm) / avg_rpm * 100
                 
-                # Add to history for smoothing
-                rpm_history.append(instant_rpm)
-                if len(rpm_history) > RPM_HISTORY_SIZE:
-                    rpm_history.pop(0)
-                
-                # Use smoothed RPM for timing (reduces jitter)
-                current_rpm = sum(rpm_history) / len(rpm_history)
-                
-                # Calculate smoothed rotation time
-                rotation_time_micros = int(60_000_000 / current_rpm)
-                
-                # Calculate time per line with safety margin
-                raw_time_per_line = rotation_time_micros // NUM_DIVISIONS
-                
-                # Ensure we have enough time for LED update
-                if raw_time_per_line < LED_UPDATE_TIME_US:
-                    # We're running too fast for this many divisions!
-                    # Just use what we have and accept some blur
-                    time_per_line_micros = LED_UPDATE_TIME_US
-                    if rotation_count % 50 == 0:
-                        max_safe_divisions = rotation_time_micros // LED_UPDATE_TIME_US
-                        print(f"⚠ RPM too high for {NUM_DIVISIONS} divisions!")
-                        print(f"  Recommended: NUM_DIVISIONS = {max_safe_divisions}")
-                else:
-                    time_per_line_micros = raw_time_per_line
-                
-                # Display status periodically
-                if rotation_count % 30 == 0:
-                    effective_divisions = rotation_time_micros // LED_UPDATE_TIME_US
-                    print(f"RPM: {current_rpm:.0f} | "
-                          f"Time/line: {time_per_line_micros}µs | "
-                          f"Max safe divisions: {effective_divisions}")
+                if rpm_change_percent > MAX_RPM_CHANGE_PERCENT:
+                    # Too big a jump - likely noise, reject it
+                    noise_rejected_count += 1
+                    last_hall_state = current_state
+                    current_line = 0
+                    rotation_count += 1
+                    last_rotation_micros = current_time
+                    return
+            
+            # Valid reading! Add to history
+            rpm_history.append(instant_rpm)
+            if len(rpm_history) > RPM_HISTORY_SIZE:
+                rpm_history.pop(0)
+            
+            valid_rotation_count += 1
+            
+            # Calculate smoothed RPM (median is more robust than mean)
+            if len(rpm_history) >= 5:
+                sorted_rpm = sorted(rpm_history)
+                # Use trimmed mean (remove highest and lowest, average rest)
+                trimmed = sorted_rpm[2:-2] if len(sorted_rpm) > 6 else sorted_rpm[1:-1]
+                stable_rpm = sum(trimmed) / len(trimmed) if trimmed else sum(sorted_rpm) / len(sorted_rpm)
+            else:
+                stable_rpm = sum(rpm_history) / len(rpm_history)
+            
+            current_rpm = stable_rpm
+            
+            # Calculate timing from stable RPM
+            rotation_time_micros = int(60_000_000 / stable_rpm)
+            time_per_line_micros = rotation_time_micros // NUM_DIVISIONS
+            
+            # Sanity check - ensure minimum time for LED update
+            if time_per_line_micros < LED_UPDATE_TIME_US:
+                time_per_line_micros = LED_UPDATE_TIME_US
+            
+            # Display status periodically (less spam)
+            if valid_rotation_count % 50 == 0:
+                max_safe = rotation_time_micros // LED_UPDATE_TIME_US
+                status = "✓" if NUM_DIVISIONS <= max_safe else "⚠"
+                print(f"{status} RPM: {stable_rpm:.0f} | "
+                      f"Line time: {time_per_line_micros}µs | "
+                      f"Noise rejected: {noise_rejected_count}")
         
         # Reset to position 0° (line 0)
         current_line = 0
@@ -387,8 +433,9 @@ def check_hall_sensor():
         
         if rotation_count == 1:
             print("\n✓ ROTATION DETECTED!")
-            print(f"Using {NUM_DIVISIONS} divisions per rotation")
-            print(f"LED update time: ~{LED_UPDATE_TIME_US}µs")
+            print(f"  Divisions: {NUM_DIVISIONS} ({360/NUM_DIVISIONS:.1f}° each)")
+            print(f"  LED update: ~{LED_UPDATE_TIME_US}µs")
+            print(f"  Default RPM: {DEFAULT_RPM}")
             print("Display active. Press buttons to change modes.\n")
     
     last_hall_state = current_state
@@ -451,75 +498,77 @@ def display_current_line():
 def main():
     global display_data
     
-    # Calculate timing info for display
+    # Calculate timing info
     rotation_time_at_default = int(60_000_000 / DEFAULT_RPM)
     time_per_line_at_default = rotation_time_at_default // NUM_DIVISIONS
     max_safe_divisions = rotation_time_at_default // LED_UPDATE_TIME_US
     degrees_per_division = 360.0 / NUM_DIVISIONS
     
+    # Calculate for RPM range
+    rotation_time_at_max = int(60_000_000 / MAX_RPM)
+    max_safe_at_max_rpm = rotation_time_at_max // LED_UPDATE_TIME_US
+    
     print("\n" + "="*65)
-    print("  POV FAN - OPTIMIZED FOR CLEAR DISPLAY")
+    print("  POV FAN - OPTIMIZED FOR HIGH-SPEED DISPLAY")
     print("="*65)
-    print("\n▸ TIMING CONFIGURATION:")
+    
+    print("\n▸ HARDWARE:")
     print(f"  • LED strip: {NUM_LEDS} WS2815 LEDs")
     print(f"  • LED update time: ~{LED_UPDATE_TIME_US}µs ({LED_UPDATE_TIME_US/1000:.1f}ms)")
-    print(f"  • Divisions per rotation: {NUM_DIVISIONS} ({degrees_per_division:.1f}° each)")
     print(f"  • Brightness: {int(BRIGHTNESS_RATIO * 100)}%")
     
-    print("\n▸ RPM CALCULATIONS (at {:.0f} RPM default):".format(DEFAULT_RPM))
-    print(f"  • Rotation time: {rotation_time_at_default:,}µs ({rotation_time_at_default/1000:.1f}ms)")
-    print(f"  • Time per line: {time_per_line_at_default:,}µs ({time_per_line_at_default/1000:.2f}ms)")
-    print(f"  • Max safe divisions: {max_safe_divisions}")
+    print("\n▸ DIVISIONS:")
+    print(f"  • {NUM_DIVISIONS} divisions ({degrees_per_division:.1f}° each)")
+    print(f"  • Time per line at {DEFAULT_RPM} RPM: {time_per_line_at_default}µs")
     
-    if NUM_DIVISIONS > max_safe_divisions:
-        print(f"\n  ⚠ WARNING: {NUM_DIVISIONS} divisions may be too many for {DEFAULT_RPM} RPM!")
-        print(f"     Consider reducing to {max_safe_divisions} or increasing fan speed.")
+    print("\n▸ RPM RANGE: {}-{} RPM".format(MIN_RPM, MAX_RPM))
+    print(f"  • At {DEFAULT_RPM} RPM: max safe = {max_safe_divisions} divisions ✓" if NUM_DIVISIONS <= max_safe_divisions else f"  • At {DEFAULT_RPM} RPM: max safe = {max_safe_divisions} divisions")
+    print(f"  • At {MAX_RPM} RPM: max safe = {max_safe_at_max_rpm} divisions" + (" ✓" if NUM_DIVISIONS <= max_safe_at_max_rpm else " ⚠"))
+    
+    if NUM_DIVISIONS <= max_safe_at_max_rpm:
+        print(f"\n  ✓ {NUM_DIVISIONS} divisions is SAFE for your RPM range!")
     else:
-        print(f"\n  ✓ Configuration looks good for {DEFAULT_RPM} RPM!")
+        print(f"\n  ⚠ May have issues above ~{int(60_000_000 / (NUM_DIVISIONS * LED_UPDATE_TIME_US))} RPM")
+    
+    print("\n▸ NOISE FILTERING:")
+    print(f"  • Hall debounce: {HALL_DEBOUNCE_US}µs")
+    print(f"  • Max RPM change: {MAX_RPM_CHANGE_PERCENT}%")
+    print(f"  • Smoothing: {RPM_HISTORY_SIZE} samples")
     
     print("\n▸ CONTROLS:")
     print("  • GPIO 17 → Circle (cyan)")
     print("  • GPIO 27 → Square (magenta)")
-    print("  • GPIO 22 → Custom Image")
-    
-    print("\n▸ RPM RANGE: {}-{} RPM".format(MIN_RPM, MAX_RPM))
+    print("  • GPIO 22 → Image")
     
     print("\n" + "="*65)
-    print("  Spin the fan to start! Waiting for hall sensor...")
+    print("  Spin the fan to start!")
     print("="*65 + "\n")
     
-    # Start with circle (regenerate with new NUM_DIVISIONS)
-    display_data = generate_circle_data(radius_leds=28, color_rgb=(0, 255, 255))
+    # Generate initial shape
+    display_data = generate_circle_data(radius_leds=26, color_rgb=(0, 255, 255))
     
-    # Startup indicator - show we're ready
+    # Startup indicator
     for i in range(NUM_LEDS):
-        if i < 5:
-            strip.setPixelColor(i, Color(0, 50, 0))  # Green = ready
-        else:
-            strip.setPixelColor(i, Color(0, 0, 0))
+        strip.setPixelColor(i, Color(0, 30, 0) if i < 3 else Color(0, 0, 0))
     strip.show()
     
     try:
         while True:
-            # Poll buttons (fast)
             check_buttons()
-            
-            # Poll hall sensor (fast) - this resets position when triggered
             check_hall_sensor()
-            
-            # Display current line with precise timing
             display_current_line()
                 
     except KeyboardInterrupt:
-        print("\n\n" + "-"*40)
-        print("Shutting down...")
-        if rotation_count > 0:
-            print(f"  Total rotations: {rotation_count}")
-            print(f"  Final RPM: {current_rpm:.1f}")
-            if missed_lines_count > 0:
-                print(f"  Missed lines: {missed_lines_count}")
+        print("\n\n" + "-"*50)
+        print("SHUTDOWN STATS:")
+        print(f"  • Total rotations: {rotation_count}")
+        print(f"  • Valid rotations: {valid_rotation_count}")
+        print(f"  • Final RPM: {stable_rpm:.1f}")
+        print(f"  • Noise rejected: {noise_rejected_count}")
+        if missed_lines_count > 0:
+            print(f"  • Missed lines: {missed_lines_count}")
         clear_strip()
-        print("-"*40)
+        print("-"*50)
         
     finally:
         GPIO.cleanup()
