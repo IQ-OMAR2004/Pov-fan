@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-POV Holographic Fan Display - CORRECT POV LOGIC
-Works directly from hall sensor readings
-No averaging, no prediction - pure real-time response
+POV Holographic Fan Display - OPTIMIZED FOR CLEAR DISPLAY
+Works directly from hall sensor readings with proper timing calculations
 
 For WS2815 LED Strip (72 LEDs) and A3144 Hall Sensor
-Optimized for 400-600 RPM
+
+TIMING CALCULATIONS:
+- WS2815 at 800kHz: each bit = 1.25µs
+- 72 LEDs × 24 bits = 1728 bits → ~2160µs minimum
+- Plus reset time (~280µs) → ~2500µs per LED update
+- At 500 RPM: rotation = 120,000µs → max ~48 divisions
+- Using 36 divisions for stable display with margin
 
 Button Controls:
 - GPIO 17: Draw Circle
@@ -24,7 +29,7 @@ NUM_LEDS = 72
 LED_PIN = 18
 LED_FREQ_HZ = 800000
 LED_DMA = 10
-LED_BRIGHTNESS = 100
+LED_BRIGHTNESS = 150  # Increased for better POV visibility
 LED_INVERT = False
 LED_CHANNEL = 0
 
@@ -33,21 +38,51 @@ BUTTON_CIRCLE = 17
 BUTTON_SQUARE = 27
 BUTTON_IMAGE = 22
 
+# ============== RPM & TIMING CONFIGURATION ==============
+# Estimated LED update time in microseconds (72 LEDs @ 800kHz + overhead)
+LED_UPDATE_TIME_US = 2800  # ~2.8ms for 72 WS2815 LEDs
+
+# Target/default RPM when starting (before hall sensor calibrates)
+DEFAULT_RPM = 500
+MIN_RPM = 200
+MAX_RPM = 1500
+
+# Calculate safe number of divisions based on LED timing
+# Formula: max_divisions = rotation_time_us / LED_UPDATE_TIME_US
+# At 500 RPM: 120,000µs / 2800µs ≈ 42 max divisions
+# Using 36 for safety margin and cleaner angles (360° / 36 = 10° per division)
+NUM_DIVISIONS = 36  # Reduced from 150 for realistic timing!
+
+# Alternative presets - uncomment based on your motor speed:
+# NUM_DIVISIONS = 24  # For slower fans (300-400 RPM) - 15° per division
+# NUM_DIVISIONS = 48  # For faster fans (600-800 RPM) - 7.5° per division
+# NUM_DIVISIONS = 72  # For very fast fans (900+ RPM) - 5° per division
+
 # ============== DISPLAY CONFIGURATION ==============
-NUM_DIVISIONS = 150  # Number of lines per rotation
-BRIGHTNESS_RATIO = 0.5
-LINES_TO_SHIFT = -18
+BRIGHTNESS_RATIO = 0.7  # Increased from 0.5 for better visibility
+LINES_TO_SHIFT = -6     # Adjusted for new division count (was -18 for 150 divisions)
+
+# Timing safety margin (microseconds to reserve for overhead)
+TIMING_MARGIN_US = 200
 
 # ============== GLOBAL VARIABLES ==============
 current_mode = "circle"
 display_data = []
 
-# Timing variables - THE SIMPLE WAY
+# Timing variables with proper defaults
 last_rotation_micros = 0
-rotation_time_micros = 0  # Time for ONE full rotation
-time_per_line_micros = 0  # Time to display each line
+rotation_time_micros = int(60_000_000 / DEFAULT_RPM)  # Default based on expected RPM
+time_per_line_micros = rotation_time_micros // NUM_DIVISIONS
 current_line = 0
 rotation_active = False
+
+# RPM tracking for display and adjustment
+current_rpm = DEFAULT_RPM
+rpm_history = []  # Store last few RPM readings for smoothing
+RPM_HISTORY_SIZE = 5  # Number of rotations to average
+
+# Actual measured timing vs expected
+actual_line_time_us = 0
 
 # Button state tracking
 last_button_states = {BUTTON_CIRCLE: GPIO.HIGH, BUTTON_SQUARE: GPIO.HIGH, BUTTON_IMAGE: GPIO.HIGH}
@@ -57,6 +92,7 @@ DEBOUNCE_TIME = 0.3
 # Hall sensor tracking
 last_hall_state = GPIO.LOW
 rotation_count = 0
+missed_lines_count = 0  # Track if we're missing lines due to slow updates
 
 # ============== GPIO SETUP ==============
 GPIO.setmode(GPIO.BCM)
@@ -95,81 +131,26 @@ def get_time_micros():
 # ============== SHAPE GENERATION ==============
 
 def generate_circle_data(radius_leds=30, color_rgb=(0, 255, 255)):
-    """Generate circle data"""
+    """
+    Generate circle data - displays at constant radius from center.
+    With fewer divisions, we make the circle thicker for visibility.
+    """
     data = []
     center_led = NUM_LEDS // 2
     r, g, b = color_rgb
+    
+    # Make circle thicker with fewer divisions (more visible)
+    # With 36 divisions, each LED position covers 10°, so we need thickness
+    circle_thickness = max(2, 5 - NUM_DIVISIONS // 20)  # Thicker for fewer divisions
     
     for angle_idx in range(NUM_DIVISIONS):
         line = [Color(0, 0, 0)] * NUM_LEDS
         
         if radius_leds < NUM_LEDS // 2:
-            led_pos_1 = center_led - radius_leds
-            led_pos_2 = center_led + radius_leds
-            
-            if 0 <= led_pos_1 < NUM_LEDS:
-                line[led_pos_1] = Color(int(g * BRIGHTNESS_RATIO), 
-                                       int(r * BRIGHTNESS_RATIO), 
-                                       int(b * BRIGHTNESS_RATIO))
-            if 0 <= led_pos_2 < NUM_LEDS:
-                line[led_pos_2] = Color(int(g * BRIGHTNESS_RATIO), 
-                                       int(r * BRIGHTNESS_RATIO), 
-                                       int(b * BRIGHTNESS_RATIO))
-        
-        data.append(line)
-    
-    return data
-
-
-def generate_square_data(side_length_leds=25, color_rgb=(255, 0, 255)):
-    """Generate CLEAR square data - very obvious square shape"""
-    data = []
-    center_led = NUM_LEDS // 2
-    r, g, b = color_rgb
-    
-    # Make square edges thicker for visibility
-    edge_thickness = 3  # LEDs thick for each edge
-    
-    for angle_idx in range(NUM_DIVISIONS):
-        line = [Color(0, 0, 0)] * NUM_LEDS
-        
-        # Calculate angle in degrees (0-360)
-        angle_deg = (angle_idx * 360.0 / NUM_DIVISIONS) % 360
-        
-        # Determine which edge of the square we're on
-        # Rotate square 45° so corners are at 45°, 135°, 225°, 315°
-        # Edges are at 0°, 90°, 180°, 270°
-        
-        # Normalize angle to 0-90 degrees (one quadrant)
-        normalized_angle = angle_deg % 90
-        
-        # Determine if we're showing an edge (flat side) or nothing (corner area)
-        # Show square ONLY on the 4 cardinal directions
-        show_edge = False
-        distance = side_length_leds // 2
-        
-        # Right edge (around 0°)
-        if (angle_deg >= 337.5 or angle_deg < 22.5):
-            show_edge = True
-            
-        # Top edge (around 90°)
-        elif (67.5 <= angle_deg < 112.5):
-            show_edge = True
-            
-        # Left edge (around 180°)
-        elif (157.5 <= angle_deg < 202.5):
-            show_edge = True
-            
-        # Bottom edge (around 270°)
-        elif (247.5 <= angle_deg < 292.5):
-            show_edge = True
-        
-        # Light up LEDs at the calculated distance if we're on an edge
-        if show_edge:
-            # Create thicker edges for visibility
-            for offset in range(-edge_thickness//2, edge_thickness//2 + 1):
-                led_pos_1 = center_led - distance + offset
-                led_pos_2 = center_led + distance + offset
+            # Draw circle outline with thickness
+            for offset in range(-circle_thickness // 2, circle_thickness // 2 + 1):
+                led_pos_1 = center_led - radius_leds + offset
+                led_pos_2 = center_led + radius_leds + offset
                 
                 if 0 <= led_pos_1 < NUM_LEDS:
                     line[led_pos_1] = Color(int(g * BRIGHTNESS_RATIO), 
@@ -179,6 +160,62 @@ def generate_square_data(side_length_leds=25, color_rgb=(255, 0, 255)):
                     line[led_pos_2] = Color(int(g * BRIGHTNESS_RATIO), 
                                            int(r * BRIGHTNESS_RATIO), 
                                            int(b * BRIGHTNESS_RATIO))
+        
+        data.append(line)
+    
+    return data
+
+
+def generate_square_data(side_length_leds=25, color_rgb=(255, 0, 255)):
+    """
+    Generate CLEAR square data using proper polar-to-cartesian math.
+    A square in polar coordinates has varying radius depending on angle.
+    """
+    data = []
+    center_led = NUM_LEDS // 2
+    r, g, b = color_rgb
+    
+    # Edge thickness for visibility
+    edge_thickness = max(2, 4 - NUM_DIVISIONS // 20)
+    
+    # Half the side length (distance from center to edge at cardinal directions)
+    half_side = side_length_leds // 2
+    
+    for angle_idx in range(NUM_DIVISIONS):
+        line = [Color(0, 0, 0)] * NUM_LEDS
+        
+        # Calculate angle in radians (0 to 2π)
+        angle_rad = (angle_idx * 2 * math.pi / NUM_DIVISIONS)
+        angle_deg = math.degrees(angle_rad) % 360
+        
+        # For a square centered at origin, the distance from center to edge
+        # varies with angle. Using the formula for a square:
+        # r = half_side / max(|cos(θ)|, |sin(θ)|)
+        cos_a = abs(math.cos(angle_rad))
+        sin_a = abs(math.sin(angle_rad))
+        
+        # Avoid division by zero
+        max_trig = max(cos_a, sin_a, 0.001)
+        
+        # Distance from center to square edge at this angle
+        distance = int(half_side / max_trig)
+        
+        # Clamp to valid LED range
+        distance = min(distance, center_led - 1)
+        
+        # Draw the square outline with thickness
+        for offset in range(-edge_thickness // 2, edge_thickness // 2 + 1):
+            led_pos_1 = center_led - distance + offset
+            led_pos_2 = center_led + distance + offset
+            
+            if 0 <= led_pos_1 < NUM_LEDS:
+                line[led_pos_1] = Color(int(g * BRIGHTNESS_RATIO), 
+                                       int(r * BRIGHTNESS_RATIO), 
+                                       int(b * BRIGHTNESS_RATIO))
+            if 0 <= led_pos_2 < NUM_LEDS:
+                line[led_pos_2] = Color(int(g * BRIGHTNESS_RATIO), 
+                                       int(r * BRIGHTNESS_RATIO), 
+                                       int(b * BRIGHTNESS_RATIO))
         
         data.append(line)
     
@@ -282,11 +319,12 @@ def check_hall_sensor():
     """
     Poll hall sensor - THIS IS THE KEY!
     When sensor triggers = 0° position (start of rotation)
-    Calculate timing from LAST rotation
+    Calculate timing from LAST rotation with smoothing
     Use that timing for CURRENT rotation
     """
     global last_hall_state, last_rotation_micros, rotation_time_micros
     global time_per_line_micros, current_line, rotation_count, rotation_active
+    global current_rpm, rpm_history, actual_line_time_us, missed_lines_count
     
     current_state = GPIO.input(HALL_SENSOR_PIN)
     
@@ -296,15 +334,50 @@ def check_hall_sensor():
         
         # Calculate how long the LAST rotation took
         if last_rotation_micros > 0:
-            rotation_time_micros = current_time - last_rotation_micros
-            # This is how much time we have for each line
-            time_per_line_micros = rotation_time_micros / NUM_DIVISIONS
+            measured_rotation_time = current_time - last_rotation_micros
             
-            # Calculate RPM for display
-            if rotation_time_micros > 0:
-                rpm = 60_000_000 / rotation_time_micros
-                if rotation_count % 20 == 0:
-                    print(f"RPM: {rpm:.1f}")
+            # Validate the measurement (reject noise/bounces)
+            # At MIN_RPM (200): max rotation time = 300,000µs (300ms)
+            # At MAX_RPM (1500): min rotation time = 40,000µs (40ms)
+            min_rotation_time = int(60_000_000 / MAX_RPM)
+            max_rotation_time = int(60_000_000 / MIN_RPM)
+            
+            if min_rotation_time <= measured_rotation_time <= max_rotation_time:
+                # Calculate RPM from this rotation
+                instant_rpm = 60_000_000 / measured_rotation_time
+                
+                # Add to history for smoothing
+                rpm_history.append(instant_rpm)
+                if len(rpm_history) > RPM_HISTORY_SIZE:
+                    rpm_history.pop(0)
+                
+                # Use smoothed RPM for timing (reduces jitter)
+                current_rpm = sum(rpm_history) / len(rpm_history)
+                
+                # Calculate smoothed rotation time
+                rotation_time_micros = int(60_000_000 / current_rpm)
+                
+                # Calculate time per line with safety margin
+                raw_time_per_line = rotation_time_micros // NUM_DIVISIONS
+                
+                # Ensure we have enough time for LED update
+                if raw_time_per_line < LED_UPDATE_TIME_US:
+                    # We're running too fast for this many divisions!
+                    # Just use what we have and accept some blur
+                    time_per_line_micros = LED_UPDATE_TIME_US
+                    if rotation_count % 50 == 0:
+                        max_safe_divisions = rotation_time_micros // LED_UPDATE_TIME_US
+                        print(f"⚠ RPM too high for {NUM_DIVISIONS} divisions!")
+                        print(f"  Recommended: NUM_DIVISIONS = {max_safe_divisions}")
+                else:
+                    time_per_line_micros = raw_time_per_line
+                
+                # Display status periodically
+                if rotation_count % 30 == 0:
+                    effective_divisions = rotation_time_micros // LED_UPDATE_TIME_US
+                    print(f"RPM: {current_rpm:.0f} | "
+                          f"Time/line: {time_per_line_micros}µs | "
+                          f"Max safe divisions: {effective_divisions}")
         
         # Reset to position 0° (line 0)
         current_line = 0
@@ -314,19 +387,22 @@ def check_hall_sensor():
         
         if rotation_count == 1:
             print("\n✓ ROTATION DETECTED!")
+            print(f"Using {NUM_DIVISIONS} divisions per rotation")
+            print(f"LED update time: ~{LED_UPDATE_TIME_US}µs")
             print("Display active. Press buttons to change modes.\n")
     
     last_hall_state = current_state
 
 
-# ============== DISPLAY FUNCTION - THE CORRECT WAY ==============
+# ============== DISPLAY FUNCTION - OPTIMIZED ==============
 
 def display_current_line():
     """
-    Display the current line, then wait precise time before next line
-    THIS is how POV should work - simple and direct!
+    Display the current line with optimized timing.
+    Key insight: LED update takes significant time (~2.5ms for 72 LEDs)
+    We must account for this in our timing calculations.
     """
-    global current_line
+    global current_line, actual_line_time_us, missed_lines_count
     
     if not rotation_active or time_per_line_micros <= 0:
         return
@@ -334,8 +410,8 @@ def display_current_line():
     # Which line to show (with rotation adjustment)
     line_to_show = (current_line + LINES_TO_SHIFT + NUM_DIVISIONS) % NUM_DIVISIONS
     
-    # Start timing
-    start_time = get_time_micros()
+    # Start timing for this line
+    line_start_time = get_time_micros()
     
     # Set LEDs for this line
     if display_data and line_to_show < len(display_data):
@@ -345,16 +421,24 @@ def display_current_line():
         strip.show()
     
     # Calculate how long LED update took
-    elapsed = get_time_micros() - start_time
+    update_time = get_time_micros() - line_start_time
+    actual_line_time_us = update_time
     
     # Wait the remaining time for this angular position
-    remaining = time_per_line_micros - elapsed
+    remaining = time_per_line_micros - update_time - TIMING_MARGIN_US
     
     if remaining > 0:
         # Precise busy-wait for accurate timing
         target_time = get_time_micros() + remaining
         while get_time_micros() < target_time:
             pass
+    elif remaining < -1000:  # More than 1ms behind
+        # We're running behind - the fan is spinning faster than we can update
+        # Skip to catch up (this prevents image from drifting)
+        lines_to_skip = int((-remaining) / time_per_line_micros)
+        if lines_to_skip > 0:
+            current_line += lines_to_skip
+            missed_lines_count += lines_to_skip
     
     # Move to next line
     current_line += 1
@@ -367,33 +451,52 @@ def display_current_line():
 def main():
     global display_data
     
-    print("\n" + "="*60)
-    print("POV FAN - CORRECT REAL-TIME LOGIC")
-    print("="*60)
-    print("\nHow it works:")
-    print("  1. Hall sensor triggers = 0° position")
-    print("  2. Measure time since last trigger = rotation time")
-    print("  3. Divide by lines = time per line")
-    print("  4. Display lines with precise timing")
-    print("  5. Sensor triggers again = back to 0°")
-    print("\nConfiguration:")
-    print(f"  Lines per rotation: {NUM_DIVISIONS}")
-    print(f"  LEDs: {NUM_LEDS}")
-    print(f"  Target RPM: 400-600")
-    print("\nButtons:")
-    print("  GPIO 17 - Circle")
-    print("  GPIO 27 - Square")
-    print("  GPIO 22 - Custom Image")
-    print("\n" + "="*60)
-    print("Spin the fan to start!")
-    print("="*60 + "\n")
+    # Calculate timing info for display
+    rotation_time_at_default = int(60_000_000 / DEFAULT_RPM)
+    time_per_line_at_default = rotation_time_at_default // NUM_DIVISIONS
+    max_safe_divisions = rotation_time_at_default // LED_UPDATE_TIME_US
+    degrees_per_division = 360.0 / NUM_DIVISIONS
     
-    # Start with circle
-    display_data = generate_circle_data()
+    print("\n" + "="*65)
+    print("  POV FAN - OPTIMIZED FOR CLEAR DISPLAY")
+    print("="*65)
+    print("\n▸ TIMING CONFIGURATION:")
+    print(f"  • LED strip: {NUM_LEDS} WS2815 LEDs")
+    print(f"  • LED update time: ~{LED_UPDATE_TIME_US}µs ({LED_UPDATE_TIME_US/1000:.1f}ms)")
+    print(f"  • Divisions per rotation: {NUM_DIVISIONS} ({degrees_per_division:.1f}° each)")
+    print(f"  • Brightness: {int(BRIGHTNESS_RATIO * 100)}%")
     
-    # Startup indicator
-    for i in range(5):
-        strip.setPixelColor(i, Color(30, 30, 150))
+    print("\n▸ RPM CALCULATIONS (at {:.0f} RPM default):".format(DEFAULT_RPM))
+    print(f"  • Rotation time: {rotation_time_at_default:,}µs ({rotation_time_at_default/1000:.1f}ms)")
+    print(f"  • Time per line: {time_per_line_at_default:,}µs ({time_per_line_at_default/1000:.2f}ms)")
+    print(f"  • Max safe divisions: {max_safe_divisions}")
+    
+    if NUM_DIVISIONS > max_safe_divisions:
+        print(f"\n  ⚠ WARNING: {NUM_DIVISIONS} divisions may be too many for {DEFAULT_RPM} RPM!")
+        print(f"     Consider reducing to {max_safe_divisions} or increasing fan speed.")
+    else:
+        print(f"\n  ✓ Configuration looks good for {DEFAULT_RPM} RPM!")
+    
+    print("\n▸ CONTROLS:")
+    print("  • GPIO 17 → Circle (cyan)")
+    print("  • GPIO 27 → Square (magenta)")
+    print("  • GPIO 22 → Custom Image")
+    
+    print("\n▸ RPM RANGE: {}-{} RPM".format(MIN_RPM, MAX_RPM))
+    
+    print("\n" + "="*65)
+    print("  Spin the fan to start! Waiting for hall sensor...")
+    print("="*65 + "\n")
+    
+    # Start with circle (regenerate with new NUM_DIVISIONS)
+    display_data = generate_circle_data(radius_leds=28, color_rgb=(0, 255, 255))
+    
+    # Startup indicator - show we're ready
+    for i in range(NUM_LEDS):
+        if i < 5:
+            strip.setPixelColor(i, Color(0, 50, 0))  # Green = ready
+        else:
+            strip.setPixelColor(i, Color(0, 0, 0))
     strip.show()
     
     try:
@@ -408,10 +511,15 @@ def main():
             display_current_line()
                 
     except KeyboardInterrupt:
-        print("\n\nShutting down...")
+        print("\n\n" + "-"*40)
+        print("Shutting down...")
         if rotation_count > 0:
-            print(f"Total rotations: {rotation_count}")
+            print(f"  Total rotations: {rotation_count}")
+            print(f"  Final RPM: {current_rpm:.1f}")
+            if missed_lines_count > 0:
+                print(f"  Missed lines: {missed_lines_count}")
         clear_strip()
+        print("-"*40)
         
     finally:
         GPIO.cleanup()
